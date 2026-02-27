@@ -1,4 +1,4 @@
-# 金融ドメインの整合性を、コードで守る
+# 金融ドメインの整合性をコードで守る
 
 金融や決済のシステムでは、データの整合性が設計の中心になります。  
 本稿では口座間送金を題材に、Goのコードで「不変条件」と「トランザクション境界」をどう守るかを扱います。
@@ -50,16 +50,45 @@
 そこで `TxManager.RunInTx` に処理を渡します。
 
 ```go
-// (ここに usecase/transfer.go の Execute 内、RunInTx に fn を渡している部分を貼る)
-return uc.tx.RunInTx(ctx, func(ctx context.Context) error {
-    from, err := uc.repo.GetByID(ctx, fromID)
-    // ... to 取得、from.Debit、to.Credit、Save(from)、Save(to)
-    return nil
-})
+func (uc *TransferUseCase) Execute(ctx context.Context, fromID, toID string, amount int64) error {
+	return uc.tx.RunInTx(ctx, func(ctx context.Context) error {
+		from, err := uc.repo.GetByID(ctx, fromID)
+		if err != nil {
+			return err
+		}
+		to, err := uc.repo.GetByID(ctx, toID)
+		if err != nil {
+			return err
+		}
+		if err := from.Debit(ctx, amount); err != nil {
+			return err // 不変条件違反時は ErrInsufficientBalance
+		}
+		if err := to.Credit(ctx, amount); err != nil {
+			return err
+		}
+		if err := uc.repo.Save(ctx, from); err != nil {
+			return err
+		}
+		if err := uc.repo.Save(ctx, to); err != nil {
+			return err
+		}
+		return nil
+	})
+}
 ```
 
 `RunInTx` の外側が「トランザクションの境界」だと読めます。  
 実装が InMemory でも DB でも、**境界の置き場所は UseCase で揃えます**。
+
+処理の流れは次のとおりです。  
+`RunInTx` のなかで「送金元・送金先の取得 → 引き落とし・入金 → 保存」が一気に実行され、どこかでエラーになればトランザクションごと取り消されます。
+
+- 呼び出し元が `Execute(fromID, toID, amount)` を呼ぶ
+- UseCase が `RunInTx` に処理を渡す
+- その中で Repository から送金元・送金先の口座を取得
+- `from.Debit(amount)` で引き落とし（残高不足ならここでエラー）
+- `to.Credit(amount)` で入金
+- 両方の口座を `Save` してトランザクション完了
 
 **2. 不変条件は Domain で守る**
 
@@ -67,11 +96,19 @@ return uc.tx.RunInTx(ctx, func(ctx context.Context) error {
 `balance` は非公開にして、引き落としは `Debit` に任せます。
 
 ```go
-// (ここに domain/account.go の Debit の残高チェック部分を貼る)
-if a.balance < amount {
-    return ErrInsufficientBalance
+// Debit は口座から指定額を引き落とす。残高がマイナスになる場合は ErrInsufficientBalance を返す。
+func (a *Account) Debit(_ context.Context, amount int64) error {
+	if amount <= 0 {
+		return ErrInvalidAmount
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.balance < amount {
+		return ErrInsufficientBalance
+	}
+	a.balance -= amount
+	return nil
 }
-a.balance -= amount
 ```
 
 「残高が足りなければ変更しない」というルールは、**Domain の一箇所**に閉じます。  
@@ -110,7 +147,6 @@ HTTP Handler で `tx.Begin()` を握り、その中で「残高チェック」�
 
 - 金融では「少し壊れる」が許されないので、**整合性設計が主役**になります。
 - 不変条件は Domain、トランザクション境界は UseCase（RunInTx）、永続化は Infra に分けると、「誰が何を守るか」がコードに表れます。
-- **一行まとめ：目的は「整合性を守ること」であり、そのための役割分担（Domain / UseCase / Infra）をはっきりさせることが重要です。**
 
 サンプル全体はリポジトリの `cmd/demo` で動かせます。  
 まずは InMemory で「境界」と「不変条件」の置き場所を確認し、あとから DB を差し替えるとよいです。
